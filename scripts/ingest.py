@@ -7,7 +7,6 @@ import os
 import re
 import shlex
 import sqlite3
-import subprocess
 import sys
 import time
 import urllib.parse
@@ -93,6 +92,40 @@ def parse_curl(path: Path):
     return args
 
 
+def parse_curl_request(path: Path):
+    args = parse_curl(path)
+    url = None
+    headers = {}
+    cookie = None
+    i = 1
+    while i < len(args):
+        arg = args[i]
+        if arg in {"-H", "--header"}:
+            i += 1
+            if i < len(args) and ":" in args[i]:
+                key, value = args[i].split(":", 1)
+                headers[key.strip()] = value.strip()
+        elif arg in {"-b", "--cookie"}:
+            i += 1
+            if i < len(args):
+                cookie = args[i]
+        elif arg in {"-X", "--request", "--url"}:
+            i += 1
+            if arg == "--url" and i < len(args):
+                url = args[i]
+        elif arg in {"-s", "-S", "-sS", "--compressed", "--location", "-L"}:
+            pass
+        elif not arg.startswith("-") and url is None:
+            url = arg
+        i += 1
+    if not url:
+        raise ValueError(f"{path} does not include a request URL")
+    if cookie:
+        headers["Cookie"] = cookie
+    headers["Accept-Encoding"] = "identity"
+    return url, headers
+
+
 def set_cursor(url: str, cursor: str | None) -> str:
     parts = urllib.parse.urlsplit(url)
     qs = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
@@ -107,11 +140,11 @@ def set_cursor(url: str, cursor: str | None) -> str:
 
 
 def curl_fetch(curl_file: Path, cursor: str | None):
-    args = parse_curl(curl_file)
-    args[1] = set_cursor(args[1], cursor)
-    args.extend(["-sS", "--compressed"])
-    out = subprocess.check_output(args, cwd=ROOT)
-    body = out.decode("utf-8", "replace")
+    url, headers = parse_curl_request(curl_file)
+    url = set_cursor(url, cursor)
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read().decode("utf-8", "replace")
     data = json.loads(body)
     if "errors" in data and not data.get("data"):
         raise RuntimeError(json.dumps(data["errors"], ensure_ascii=False)[:1000])
