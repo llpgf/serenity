@@ -26,6 +26,11 @@ CURL_FILES = {
 }
 CASHTAG_RE = re.compile(r"(?<![A-Za-z0-9_])\$([A-Z][A-Z0-9.]{0,9})(?![A-Za-z0-9_])")
 NOISE_SYMBOLS = {"AI", "I", "A", "USD", "US", "CEO", "ETF", "IPO"}
+TRADINGVIEW_PRICE_SYMBOLS = {
+    # Sivers Semiconductors trades on Nasdaq Stockholm; Yahoo's chart endpoint
+    # does not return bars for the plain cashtag symbol.
+    "SIVE": ("OMXSTO", "SIVE"),
+}
 
 
 def connect():
@@ -268,6 +273,49 @@ def yahoo_chart(symbol, start, end):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def save_price_bars(con, symbol, timestamps, closes, volumes):
+    inserted = 0
+    for ts, close, vol in zip(timestamps, closes, volumes):
+        if close is None:
+            continue
+        date = dt.datetime.fromtimestamp(ts, dt.timezone.utc).date().isoformat()
+        con.execute(
+            "insert or replace into prices(symbol, date, close, volume) values (?, ?, ?, ?)",
+            (symbol, date, float(close), int(vol or 0)),
+        )
+        inserted += 1
+    con.commit()
+    return inserted
+
+
+def tradingview_candles(days_back):
+    return max(30, int(days_back * 5 / 7) + 20)
+
+
+def tradingview_price_bars(symbol, days_back):
+    if symbol not in TRADINGVIEW_PRICE_SYMBOLS:
+        return None
+    from fetch_tv_price import fetch_ohlc
+
+    exchange, tv_symbol = TRADINGVIEW_PRICE_SYMBOLS[symbol]
+    rows = fetch_ohlc(exchange, tv_symbol, "1d", tradingview_candles(days_back))
+    if not rows:
+        return None
+    timestamps = [row["timestamp"] for row in rows]
+    closes = [row["close"] for row in rows]
+    volumes = [row.get("volume") or 0 for row in rows]
+    return exchange, tv_symbol, timestamps, closes, volumes
+
+
+def save_tradingview_price_bars(con, symbol, days_back):
+    tv = tradingview_price_bars(symbol, days_back)
+    if tv is None:
+        return None
+    exchange, tv_symbol, timestamps, closes, volumes = tv
+    inserted = save_price_bars(con, symbol, timestamps, closes, volumes)
+    return inserted, exchange, tv_symbol
+
+
 def fetch_prices(days_back=420, min_mentions=2):
     con = connect()
     symbols = symbol_list(con, min_mentions)
@@ -277,33 +325,45 @@ def fetch_prices(days_back=420, min_mentions=2):
     today = dt.datetime.now(dt.timezone.utc)
     start = today - dt.timedelta(days=days_back)
     for symbol in symbols:
+        inserted = 0
         try:
             print(f"price {symbol}")
             data = yahoo_chart(symbol, start, today + dt.timedelta(days=2))
             result = (data.get("chart") or {}).get("result") or []
             if not result:
-                print(f"  no yahoo result for {symbol}")
+                print(f"  no yahoo result for {symbol}; trying mapped fallback")
+                fallback = save_tradingview_price_bars(con, symbol, days_back)
+                if fallback is None:
+                    continue
+                inserted, exchange, tv_symbol = fallback
+                print(f"  {inserted} bars from TradingView {exchange}:{tv_symbol}")
+                time.sleep(0.2)
                 continue
             res = result[0]
             timestamps = res.get("timestamp") or []
             quote = ((res.get("indicators") or {}).get("quote") or [{}])[0]
             closes = quote.get("close") or []
             volumes = quote.get("volume") or []
-            inserted = 0
-            for ts, close, vol in zip(timestamps, closes, volumes):
-                if close is None:
-                    continue
-                date = dt.datetime.fromtimestamp(ts, dt.timezone.utc).date().isoformat()
-                con.execute(
-                    "insert or replace into prices(symbol, date, close, volume) values (?, ?, ?, ?)",
-                    (symbol, date, float(close), int(vol or 0)),
-                )
-                inserted += 1
-            con.commit()
+            inserted = save_price_bars(con, symbol, timestamps, closes, volumes)
             print(f"  {inserted} bars")
+            if inserted == 0:
+                fallback = save_tradingview_price_bars(con, symbol, days_back)
+                if fallback is not None:
+                    inserted, exchange, tv_symbol = fallback
+                    print(f"  {inserted} bars from TradingView {exchange}:{tv_symbol}")
             time.sleep(0.2)
         except Exception as exc:
-            print(f"  failed {symbol}: {exc}", file=sys.stderr)
+            try:
+                fallback = save_tradingview_price_bars(con, symbol, days_back)
+                if fallback is None:
+                    print(f"  failed {symbol}: {exc}", file=sys.stderr)
+                    continue
+                inserted, exchange, tv_symbol = fallback
+                print(f"  yahoo failed for {symbol}: {exc}", file=sys.stderr)
+                print(f"  {inserted} bars from TradingView {exchange}:{tv_symbol}")
+                time.sleep(0.2)
+            except Exception as fallback_exc:
+                print(f"  failed {symbol}: {exc}; fallback failed: {fallback_exc}", file=sys.stderr)
 
 
 def main():
